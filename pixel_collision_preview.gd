@@ -15,7 +15,7 @@ var generator: RefCounted:
 		generator = value
 		queue_redraw()
 
-## 要叠加显示的多边形（图块本地坐标，原点在左下角）。
+## 要叠加显示的多边形（Godot 图块本地坐标：原点在图块中心，y 向下为正）。
 var polygons: Array = []:
 	set(value):
 		polygons = value
@@ -64,11 +64,12 @@ func _draw() -> void:
 
 	var content := _content_rect()
 	if tile_texture != null:
-		# 图块本地坐标（原点左下、y 向上）-> 控件屏幕坐标（原点左上、y 向下）
+		# 图块本地坐标（原点中心、y 向下）-> 控件屏幕坐标（原点左上、y 向下）
 		var scale_x := content.size.x / maxf(tile_size.x, 1.0)
 		var scale_y := content.size.y / maxf(tile_size.y, 1.0)
+		var half := Vector2(tile_size.x, tile_size.y) * 0.5
 		var to_screen := func(p: Vector2) -> Vector2:
-			return content.position + Vector2(p.x * scale_x, (tile_size.y - p.y) * scale_y)
+			return content.position + Vector2((p.x + half.x) * scale_x, (p.y + half.y) * scale_y)
 		draw_texture_rect(tile_texture, content, false)
 		if show_mask and generator != null and generator.has_method("get_grid"):
 			_draw_mask(content, scale_x, scale_y)

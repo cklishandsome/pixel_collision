@@ -272,7 +272,7 @@ func _build_ui() -> void:
 	_fix_x_spin.value_changed.connect(_on_param_changed)
 	fix_row.add_child(_fix_x_spin)
 	_fix_y_spin = _make_spin(0.0, -256.0, 256.0, 1.0)
-	_fix_y_spin.tooltip_text = "把生成的所有形状整体上移(+)/下移(-)这么多像素。"
+	_fix_y_spin.tooltip_text = "把生成的所有形状整体下移(+)/上移(-)这么多像素。"
 	_fix_y_spin.value_changed.connect(_on_param_changed)
 	fix_row.add_child(_fix_y_spin)
 	_fix_flip_x_check = CheckBox.new()
@@ -286,7 +286,7 @@ func _build_ui() -> void:
 	_fix_flip_y_check.toggled.connect(_on_fix_flip_toggled)
 	fix_row.add_child(_fix_flip_y_check)
 	var fix_hint := Label.new()
-	fix_hint.text = "默认已按 Godot 的中心原点/y 向下对齐，一般填 0 即可。仍偏了才用这里：往右偏填负数、往上偏填负数。"
+	fix_hint.text = "默认已按 Godot 的中心原点/y 向下对齐，一般填 0 即可。仍偏了才用这里：图形偏右填负 X、偏下填负 Y。"
 	fix_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	fix_hint.add_theme_font_size_override("font_size", 11)
 	add_child(fix_hint)
@@ -716,18 +716,7 @@ func _on_view_toggled(_pressed: bool) -> void:
 
 
 func _on_fix_flip_toggled(_pressed: bool) -> void:
-	_apply_offset_fix()
-
-
-## 把「位置微调」应用到一个已经存在的生成器上（供预览用，避免再走一次全量重建）。
-func _apply_offset_fix(gen: RefCounted = null) -> void:
-	var target: RefCounted = gen if gen != null else _generator
-	if target == null:
-		return
-	target["fix_offset"] = Vector2(_fix_x_spin.value, _fix_y_spin.value)
-	target["fix_flip_x"] = _fix_flip_x_check.button_pressed
-	target["fix_flip_y"] = _fix_flip_y_check.button_pressed
-	target["fix_tile_size"] = Vector2(float(_tile_size.x), float(_tile_size.y))
+	_queue_all()
 
 
 func _on_grid_tile_pressed(coords: Vector2i) -> void:
@@ -803,39 +792,11 @@ func _run_detection() -> void:
 		return
 	_polygons = _result.get("polygons", [])
 	_update_preview_content(coords)
-	# 微调偏移/翻转与图块像素尺寸有关，等尺寸确定后再套一遍，保证预览与写入一致。
-	_apply_offset_fix(_generator)
-	_polygons = _build_fixed_polygons()
 	var points := 0
 	for poly in _polygons:
 		points += poly.size()
 	_stats_label.text = "识别到 %d 个不透明像素 → %d 个多边形，共 %d 个顶点。" \
 			% [int(_result.get("pixel_count", 0)), _polygons.size(), points]
-
-
-## 微调偏移/翻转的二次套用（预览用；写入时由生成器内部统一处理）。
-func _build_fixed_polygons() -> Array:
-	if _generator == null:
-		return []
-	var raw: Array = _result.get("polygons", [])
-	var off := Vector2(_fix_x_spin.value, _fix_y_spin.value)
-	var fx := _fix_flip_x_check.button_pressed
-	var fy := _fix_flip_y_check.button_pressed
-	if off == Vector2.ZERO and not fx and not fy:
-		return raw
-	var out: Array = []
-	for poly in raw:
-		var pts := PackedVector2Array()
-		for p in poly:
-			var q: Vector2 = p
-			# 坐标原点在图块中心，所以镜像就是把该轴取反
-			if fx:
-				q.x = -q.x
-			if fy:
-				q.y = -q.y
-			pts.append(q + off)
-		out.append(pts)
-	return out
 
 
 func _update_preview_content(coords: Vector2i) -> void:
