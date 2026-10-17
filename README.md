@@ -118,3 +118,5 @@ if result.ok:
     var td := (tile_set.get_source(source_id) as TileSetAtlasSource).get_tile_data(atlas_coords, alternative_id)
     gen.push_to_tile_data(td, physics_layer, result.polygons, false)
 ```
+## 示例：
+<img width="3840" height="2088" alt="image" src="https://github.com/user-attachments/assets/d3096dfc-998f-4250-b898-4bf7f2a98b3c" />
