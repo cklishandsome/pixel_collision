@@ -4,10 +4,15 @@ extends VBoxContainer
 ## 「像素碰撞」插件的主面板（Dock）。
 ##
 ## 用法：在场景里选中一个 TileMapLayer（或 TileMap），在下方拖拽/点击选择图块，
-## 选好物理层，点「应用到当前图块」或「应用到整个图集」。
+## 选好目标层（物理层或遮挡层），点「应用到当前图块」或「应用到整个图集」。
 
 const PixelCollisionGeneratorScript := preload("res://addons/pixel_collision/pixel_collision_generator.gd")
 const PixelCollisionPreviewScript := preload("res://addons/pixel_collision/pixel_collision_preview.gd")
+
+## 目标层类型（与 PixelCollisionGenerator.TargetKind 保持一致）。
+const TARGET_KIND_PHYSICS := 0
+const TARGET_KIND_OCCLUSION := 1
+const CULL_NAMES := ["双向遮挡（不剔除）", "顺时针剔除（单向）", "逆时针剔除（单向）"]
 
 const MODE_NAMES := ["精确轮廓", "凸包（顶点最少）", "逐行矩形", "少量矩形"]
 const MODE_HINTS := [
@@ -65,7 +70,11 @@ var _coords_y: SpinBox
 var _alt_spin: SpinBox
 var _grid_scroll: ScrollContainer
 var _grid: GridContainer
-var _physics_layers: OptionButton
+var _target_kind: OptionButton
+var _target_layers: OptionButton
+var _occlusion_options: HBoxContainer
+var _occluder_closed_check: CheckBox
+var _occluder_cull_option: OptionButton
 var _threshold_slider: HSlider
 var _threshold_spin: SpinBox
 var _mode_button: OptionButton
@@ -110,7 +119,7 @@ func _ready() -> void:
 
 func _build_ui() -> void:
 	var title := Label.new()
-	title.text = "像素碰撞 — 按像素自动生成碰撞形状"
+	title.text = "像素碰撞 — 按像素自动生成碰撞 / 遮挡形状"
 	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	title.add_theme_font_size_override("font_size", 13)
 	add_child(title)
@@ -169,12 +178,36 @@ func _build_ui() -> void:
 	atlas_button.pressed.connect(_on_reload_atlas_pressed)
 	grid_row.add_child(atlas_button)
 
-	# --- 目标物理层 ---
-	add_child(_make_header("目标物理层"))
-	_physics_layers = OptionButton.new()
-	_physics_layers.tooltip_text = "生成的碰撞多边形要写入的物理层（对应 TileSet 的物理层索引）。"
-	_physics_layers.item_selected.connect(_on_physics_layer_changed)
-	add_child(_physics_layers)
+	# --- 目标层 ---
+	add_child(_make_header("目标层"))
+	_target_kind = OptionButton.new()
+	_target_kind.add_item("物理碰撞层", TARGET_KIND_PHYSICS)
+	_target_kind.add_item("遮挡层（2D 光照遮挡）", TARGET_KIND_OCCLUSION)
+	_target_kind.selected = 0
+	_target_kind.tooltip_text = "选择生成的形状写到物理碰撞层还是遮挡层（TileSet 面板里的「遮挡」层）。"
+	_target_kind.item_selected.connect(_on_target_kind_changed)
+	add_child(_target_kind)
+	_target_layers = OptionButton.new()
+	_target_layers.tooltip_text = "生成的形状要写入的层索引（对应 TileSet 里物理层 / 遮挡层的顺序）。"
+	_target_layers.item_selected.connect(_on_target_layer_changed)
+	add_child(_target_layers)
+
+	# 遮挡层专用选项：闭合多边形 + 剔除方向。
+	_occlusion_options = HBoxContainer.new()
+	_occlusion_options.visible = false
+	add_child(_occlusion_options)
+	_occluder_closed_check = CheckBox.new()
+	_occluder_closed_check.text = "闭合"
+	_occluder_closed_check.button_pressed = true
+	_occluder_closed_check.tooltip_text = "勾选 = 闭合多边形，整块区域挡光；不勾 = 只沿轮廓拉一条挡光的线（适合薄边）。"
+	_occlusion_options.add_child(_occluder_closed_check)
+	_occluder_cull_option = OptionButton.new()
+	for i in CULL_NAMES.size():
+		_occluder_cull_option.add_item(CULL_NAMES[i], i)
+	_occluder_cull_option.selected = 0
+	_occluder_cull_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_occluder_cull_option.tooltip_text = "遮挡多边形的剔除方向（Cull Mode）。双向遮挡 = 两面都挡光；顺时针 / 逆时针 = 剔除某一面的挡光，适合单向光照的薄墙。"
+	_occlusion_options.add_child(_occluder_cull_option)
 
 	# --- 识别设置 ---
 	add_child(_make_header("识别设置"))
@@ -474,7 +507,7 @@ func _on_reload_atlas_pressed() -> void:
 
 func _rebuild_atlas_ui() -> void:
 	if _tile_set == null:
-		_physics_layers.clear()
+		_target_layers.clear()
 		_clear_grid()
 		_source_spin.editable = false
 		_apply_current_button.disabled = true
@@ -495,26 +528,37 @@ func _rebuild_atlas_ui() -> void:
 			_coords_x.set_value_no_signal(0)
 			_coords_y.set_value_no_signal(0)
 			_alt_spin.set_value_no_signal(0)
-	_rebuild_physics_layers()
+	_rebuild_target_layers()
 	_rebuild_grid()
 	_apply_current_button.disabled = false
 	_apply_all_button.disabled = false
 	_queue_all()
 
 
-func _rebuild_physics_layers() -> void:
-	_physics_layers.clear()
+func _rebuild_target_layers() -> void:
+	_target_layers.clear()
 	if _tile_set == null:
+		return
+	if _target_kind.selected == TARGET_KIND_OCCLUSION:
+		for i in _tile_set.get_occlusion_layers_count():
+			_target_layers.add_item("遮挡层 %d（光照层 %d）" \
+					% [i, _tile_set.get_occlusion_layer_light_mask(i)])
+		if _target_layers.item_count == 0:
+			_target_layers.add_item("（TileSet 里还没有遮挡层）")
+			_target_layers.disabled = true
+		else:
+			_target_layers.disabled = false
+			_target_layers.selected = 0
 		return
 	for i in _tile_set.get_physics_layers_count():
 		var layer_bits := _tile_set.get_physics_layer_collision_layer(i)
-		_physics_layers.add_item("物理层 %d（碰撞层 %d）" % [i, layer_bits])
-	if _physics_layers.item_count == 0:
-		_physics_layers.add_item("（TileSet 里还没有物理层）")
-		_physics_layers.disabled = true
+		_target_layers.add_item("物理层 %d（碰撞层 %d）" % [i, layer_bits])
+	if _target_layers.item_count == 0:
+		_target_layers.add_item("（TileSet 里还没有物理层）")
+		_target_layers.disabled = true
 	else:
-		_physics_layers.disabled = false
-		_physics_layers.selected = 0
+		_target_layers.disabled = false
+		_target_layers.selected = 0
 
 
 func _find_first_atlas_source_id() -> int:
@@ -536,10 +580,16 @@ func _get_atlas_source(source_id: int) -> TileSetAtlasSource:
 	return null
 
 
-func _get_physics_layer_index() -> int:
-	if _physics_layers.disabled or _physics_layers.item_count == 0:
+func _get_target_layer_index() -> int:
+	if _target_layers.disabled or _target_layers.item_count == 0:
 		return -1
-	return _physics_layers.selected
+	return _target_layers.selected
+
+
+func _missing_layer_hint() -> String:
+	if _target_kind.selected == TARGET_KIND_OCCLUSION:
+		return "TileSet 里还没有遮挡层：打开 TileSet 面板，在「遮挡」区点「添加遮挡层」后再试。"
+	return "TileSet 里还没有物理层：打开 TileSet 面板，在「物理」区点「添加物理层」后再试。"
 
 
 # === 图块选择器（把整张图集按真实比例铺成按钮阵列） ======================
@@ -665,7 +715,13 @@ func _on_alt_changed(value: float) -> void:
 	_queue_all()
 
 
-func _on_physics_layer_changed(_index: int) -> void:
+func _on_target_kind_changed(index: int) -> void:
+	_occlusion_options.visible = index == TARGET_KIND_OCCLUSION
+	_rebuild_target_layers()
+	_queue_all()
+
+
+func _on_target_layer_changed(_index: int) -> void:
 	_queue_all()
 
 
@@ -771,7 +827,7 @@ func _make_generator() -> RefCounted:
 
 func _run_detection() -> void:
 	_polygons = []
-	var layer := _get_physics_layer_index()
+	var layer := _get_target_layer_index()
 	if _tile_set == null or layer < 0:
 		_result = {}
 		_preview.clear()
@@ -783,7 +839,8 @@ func _run_detection() -> void:
 	if atlas_for_size != null and atlas_for_size.texture_region_size.x > 0:
 		_tile_size = atlas_for_size.texture_region_size
 	_generator = _make_generator()
-	_result = _generator.call("detect", _tile_set, _source_id, coords, _alternative_id, layer)
+	_result = _generator.call("detect", _tile_set, _source_id, coords, _alternative_id, \
+			layer, _target_kind.selected)
 	if not bool(_result.get("ok", false)):
 		_polygons = []
 		_preview.clear()
@@ -838,9 +895,13 @@ func _ensure_current_tile_selected() -> void:
 # === 写入 ================================================================
 
 func _on_apply_current() -> void:
-	var layer := _get_physics_layer_index()
-	if _tile_set == null or layer < 0:
-		_set_status("先选中一个 TileMapLayer 并确认物理层。", true)
+	var layer := _get_target_layer_index()
+	var kind := _target_kind.selected
+	if _tile_set == null:
+		_set_status("先选中一个 TileMapLayer 并确认目标层。", true)
+		return
+	if layer < 0:
+		_set_status(_missing_layer_hint(), true)
 		return
 	var atlas := _get_atlas_source(_source_id)
 	var coords := _selected_atlas_coords()
@@ -853,7 +914,8 @@ func _on_apply_current() -> void:
 		for i in atlas.get_alternative_tiles_count(coords):
 			alternatives.append(atlas.get_alternative_tile_id(coords, i))
 	var undo: Variant = _editor.get_editor_undo_redo()
-	undo.create_action("自动生成图块碰撞形状")
+	undo.create_action("自动生成图块遮挡形状" if kind == TARGET_KIND_OCCLUSION \
+			else "自动生成图块碰撞形状")
 	undo.add_do_reference(_tile_set)
 	var applied := 0
 	var polygons_total := 0
@@ -863,26 +925,14 @@ func _on_apply_current() -> void:
 		var tile_data := atlas.get_tile_data(coords, alt)
 		if tile_data == null:
 			continue
-		var layer_count := _tile_set.get_physics_layers_count()
-		for i in layer_count:
-			undo.add_undo_method(tile_data, "set_collision_polygons_count", i, \
-					tile_data.get_collision_polygons_count(i))
-			var old_points := tile_data.get_collision_polygons_count(i)
-			for j in old_points:
-				undo.add_undo_method(tile_data, "set_collision_polygon_points", i, j, \
-						tile_data.get_collision_polygon_points(i, j))
 		var gen := _make_generator()
-		var result: Dictionary = gen.call("detect", _tile_set, _source_id, coords, alt, layer)
+		var result: Dictionary = gen.call("detect", _tile_set, _source_id, coords, alt, \
+				layer, kind)
 		if not bool(result.get("ok", false)):
 			continue
 		var polygons: Array = result.get("polygons", [])
-		var append := _append_check.button_pressed
-		var base_count := tile_data.get_collision_polygons_count(layer) if append else 0
-		undo.add_do_method(tile_data, "set_collision_polygons_count", layer, \
-				base_count + polygons.size())
-		for i in polygons.size():
-			undo.add_do_method(tile_data, "set_collision_polygon_points", layer, \
-					base_count + i, polygons[i])
+		_capture_undo_state(undo, tile_data, kind)
+		_record_write(undo, tile_data, layer, kind, polygons)
 		applied += 1
 		polygons_total += polygons.size()
 	undo.commit_action()
@@ -891,15 +941,23 @@ func _on_apply_current() -> void:
 		return
 	atlas.emit_changed()
 	_tile_set.emit_changed()
-	_set_status("已写入：%d 个替代图块，共 %d 个碰撞多边形（物理层 %d）。" \
-			% [applied, polygons_total, layer])
+	if kind == TARGET_KIND_OCCLUSION:
+		_set_status("已写入：%d 个替代图块，共 %d 个遮挡多边形（遮挡层 %d）。" \
+				% [applied, polygons_total, layer])
+	else:
+		_set_status("已写入：%d 个替代图块，共 %d 个碰撞多边形（物理层 %d）。" \
+				% [applied, polygons_total, layer])
 	_queue_all()
 
 
 func _on_apply_all() -> void:
-	var layer := _get_physics_layer_index()
-	if _tile_set == null or layer < 0:
-		_set_status("先选中一个 TileMapLayer 并确认物理层。", true)
+	var layer := _get_target_layer_index()
+	var kind := _target_kind.selected
+	if _tile_set == null:
+		_set_status("先选中一个 TileMapLayer 并确认目标层。", true)
+		return
+	if layer < 0:
+		_set_status(_missing_layer_hint(), true)
 		return
 	var atlas := _get_atlas_source(_source_id)
 	if atlas == null:
@@ -907,7 +965,8 @@ func _on_apply_all() -> void:
 		return
 	var gen := _make_generator()
 	var undo: Variant = _editor.get_editor_undo_redo()
-	undo.create_action("批量自动生成图块碰撞形状")
+	undo.create_action("批量自动生成图块遮挡形状" if kind == TARGET_KIND_OCCLUSION \
+			else "批量自动生成图块碰撞形状")
 	undo.add_do_reference(_tile_set)
 	var tiles := 0
 	var polygons_total := 0
@@ -917,33 +976,75 @@ func _on_apply_all() -> void:
 		var tile_data := atlas.get_tile_data(coords, _alternative_id)
 		if tile_data == null:
 			continue
-		var result: Dictionary = gen.call("detect", _tile_set, _source_id, coords, _alternative_id, layer)
+		var result: Dictionary = gen.call("detect", _tile_set, _source_id, coords, \
+				_alternative_id, layer, kind)
 		if not bool(result.get("ok", false)):
 			skipped += 1
 			continue
 		var polygons: Array = result.get("polygons", [])
-		for li in _tile_set.get_physics_layers_count():
-			undo.add_undo_method(tile_data, "set_collision_polygons_count", li, \
-					tile_data.get_collision_polygons_count(li))
-			for j in tile_data.get_collision_polygons_count(li):
-				undo.add_undo_method(tile_data, "set_collision_polygon_points", li, j, \
-						tile_data.get_collision_polygon_points(li, j))
-		var append := _append_check.button_pressed
-		var base_count := tile_data.get_collision_polygons_count(layer) if append else 0
-		undo.add_do_method(tile_data, "set_collision_polygons_count", layer, \
-				base_count + polygons.size())
-		for k in polygons.size():
-			undo.add_do_method(tile_data, "set_collision_polygon_points", layer, \
-					base_count + k, polygons[k])
+		_capture_undo_state(undo, tile_data, kind)
+		_record_write(undo, tile_data, layer, kind, polygons)
 		tiles += 1
 		polygons_total += polygons.size()
 	undo.commit_action()
 	atlas.emit_changed()
 	_tile_set.emit_changed()
 	_apply_current_button.disabled = false
-	_set_status("批量完成：%d 张图块、共 %d 个碰撞多边形；%d 张图块无有效像素被跳过。" \
-			% [tiles, polygons_total, skipped])
+	if kind == TARGET_KIND_OCCLUSION:
+		_set_status("批量完成：%d 张图块、共 %d 个遮挡多边形；%d 张图块无有效像素被跳过。" \
+				% [tiles, polygons_total, skipped])
+	else:
+		_set_status("批量完成：%d 张图块、共 %d 个碰撞多边形；%d 张图块无有效像素被跳过。" \
+				% [tiles, polygons_total, skipped])
 	_queue_all()
+
+
+## 记录该图块在「所有同类层」上的旧状态，供 Ctrl+Z 恢复。
+## UndoRedo 的撤销按添加顺序倒序执行，所以数量必须最后添加、从而最先恢复，
+## 否则「新形状比旧形状少」时恢复多余顶点的索引会越界。
+func _capture_undo_state(undo: Variant, tile_data: TileData, kind: int) -> void:
+	if kind == TARGET_KIND_OCCLUSION:
+		for li in _tile_set.get_occlusion_layers_count():
+			var old_count := tile_data.get_occluder_polygons_count(li)
+			for j in old_count:
+				undo.add_undo_method(tile_data, "set_occluder_polygon", li, j, \
+						tile_data.get_occluder_polygon(li, j))
+			undo.add_undo_method(tile_data, "set_occluder_polygons_count", li, old_count)
+		return
+	for li in _tile_set.get_physics_layers_count():
+		var old_count := tile_data.get_collision_polygons_count(li)
+		for j in old_count:
+			undo.add_undo_method(tile_data, "set_collision_polygon_points", li, j, \
+					tile_data.get_collision_polygon_points(li, j))
+		undo.add_undo_method(tile_data, "set_collision_polygons_count", li, old_count)
+
+
+## 把一组多边形登记为「执行方法」，由撤销系统在 commit 时真正写进 TileData。
+## 遮挡层每条多边形包成一个独立的 OccluderPolygon2D，绝不在图块之间共享资源。
+func _record_write(undo: Variant, tile_data: TileData, layer: int, kind: int, \
+		polygons: Array) -> void:
+	var append := _append_check.button_pressed
+	var base_count := 0
+	if kind == TARGET_KIND_OCCLUSION:
+		if append:
+			base_count = tile_data.get_occluder_polygons_count(layer)
+		undo.add_do_method(tile_data, "set_occluder_polygons_count", layer, \
+				base_count + polygons.size())
+		for i in polygons.size():
+			var occluder := OccluderPolygon2D.new()
+			occluder.polygon = polygons[i]
+			occluder.closed = _occluder_closed_check.button_pressed
+			occluder.cull_mode = _occluder_cull_option.selected
+			undo.add_do_method(tile_data, "set_occluder_polygon", layer, \
+					base_count + i, occluder)
+		return
+	if append:
+		base_count = tile_data.get_collision_polygons_count(layer)
+	undo.add_do_method(tile_data, "set_collision_polygons_count", layer, \
+			base_count + polygons.size())
+	for i in polygons.size():
+		undo.add_do_method(tile_data, "set_collision_polygon_points", layer, \
+				base_count + i, polygons[i])
 
 
 func _set_status(text: String, is_warning: bool = false) -> void:

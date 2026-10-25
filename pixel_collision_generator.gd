@@ -2,7 +2,7 @@
 class_name PixelCollisionGenerator
 extends RefCounted
 
-## 从图块贴图的 alpha 通道自动生成碰撞多边形。
+## 从图块贴图的 alpha 通道自动生成碰撞 / 遮挡多边形。
 ##
 ## 纯算法模块：不依赖编辑器，可单独在运行时使用。
 ## 用法：
@@ -10,6 +10,16 @@ extends RefCounted
 ##     gen.alpha_threshold = 0.5
 ##     var result := gen.detect(tile_set, source_id, atlas_coords, alternative_id, physics_layer)
 ##     gen.push_to_tile_data(tile_data, physics_layer, result.polygons)
+## 遮挡层同理，只是 detect() 最后一个参数传 TargetKind.OCCLUSION，
+## 再用 push_occluders_to_tile_data() 写入。
+
+## 生成的多边形要写到哪种层。
+enum TargetKind {
+	## 物理碰撞层（TileData 的 collision polygons）。
+	PHYSICS,
+	## 遮挡层（TileData 的 occluder polygons，用于 2D 光照遮挡）。
+	OCCLUSION,
+}
 
 enum Mode {
 	## 精确轮廓：沿不透明像素外描出一圈多边形（最贴合像素）。
@@ -75,12 +85,15 @@ var _pixel_count := 0
 
 # === 公开 API ============================================================
 
-## 检测一张图块的碰撞区域。
+## 检测一张图块的碰撞 / 遮挡区域。
+## target_kind 决定 layer_index 是物理层还是遮挡层索引。
 ## 返回 { ok: bool, error: String, size: Vector2i, polygons: Array,
 ##        pixel_count: int, source_id: int, atlas_coords: Vector2i, alternative_id: int,
-##        physics_layer: int }
+##        target_kind: int, layer: int, physics_layer: int, occlusion_layer: int }
+## physics_layer / occlusion_layer 只有对应目标才有有效索引，另一个为 -1。
 func detect(p_tile_set: TileSet, source_id: int, atlas_coords: Vector2i, \
-		alternative_id: int, physics_layer: int) -> Dictionary:
+		alternative_id: int, layer_index: int, \
+		target_kind: int = TargetKind.PHYSICS) -> Dictionary:
 	var result := {
 		"ok": false,
 		"error": "",
@@ -90,12 +103,23 @@ func detect(p_tile_set: TileSet, source_id: int, atlas_coords: Vector2i, \
 		"source_id": source_id,
 		"atlas_coords": atlas_coords,
 		"alternative_id": alternative_id,
-		"physics_layer": physics_layer,
+		"target_kind": target_kind,
+		"layer": layer_index,
+		"physics_layer": layer_index if target_kind == TargetKind.PHYSICS else -1,
+		"occlusion_layer": layer_index if target_kind == TargetKind.OCCLUSION else -1,
 	}
 	if p_tile_set == null:
 		result.error = "没有 TileSet。"
 		return result
-	if physics_layer < 0 or physics_layer >= p_tile_set.get_physics_layers_count():
+	if target_kind != TargetKind.PHYSICS and target_kind != TargetKind.OCCLUSION:
+		result.error = "未知的目标层类型：%d。" % target_kind
+		return result
+	if target_kind == TargetKind.OCCLUSION:
+		if layer_index < 0 or layer_index >= p_tile_set.get_occlusion_layers_count():
+			result.error = "遮挡层索引无效（TileSet 中只有 %d 个遮挡层）。" \
+					% p_tile_set.get_occlusion_layers_count()
+			return result
+	elif layer_index < 0 or layer_index >= p_tile_set.get_physics_layers_count():
 		result.error = "物理层索引无效（TileSet 中只有 %d 个物理层）。" % p_tile_set.get_physics_layers_count()
 		return result
 	var source := p_tile_set.get_source(source_id)
@@ -122,7 +146,7 @@ func detect(p_tile_set: TileSet, source_id: int, atlas_coords: Vector2i, \
 	return result
 
 
-## 把多边形写入 TileData 的指定物理层。mult 用于支持「加到已有形状」。
+## 把多边形写入 TileData 的指定物理层。append = true 时追加到已有形状。
 ## 返回写入的多边形数量。
 func push_to_tile_data(tile_data: TileData, physics_layer: int, \
 		polygons: Array, append: bool = false) -> int:
@@ -136,6 +160,30 @@ func push_to_tile_data(tile_data: TileData, physics_layer: int, \
 		tile_data.set_collision_polygons_count(physics_layer, polygons.size())
 	for i in polygons.size():
 		tile_data.set_collision_polygon_points(physics_layer, polygon_count + i, polygons[i])
+	return polygons.size()
+
+
+## 把多边形写入 TileData 的指定遮挡层（每条多边形包成一个 OccluderPolygon2D）。
+## closed = true 表示闭合多边形（挡住整块区域）；false 则只是一条挡光的线段。
+## cull_mode 传 OccluderPolygon2D.CULL_DISABLED / CULL_CLOCKWISE / CULL_COUNTER_CLOCKWISE，
+## 默认双向遮挡。返回写入的多边形数量。
+func push_occluders_to_tile_data(tile_data: TileData, occlusion_layer: int, \
+		polygons: Array, append: bool = false, closed: bool = true, \
+		cull_mode: int = OccluderPolygon2D.CULL_DISABLED) -> int:
+	if tile_data == null or occlusion_layer < 0:
+		return 0
+	var base_count := 0
+	if append:
+		base_count = tile_data.get_occluder_polygons_count(occlusion_layer)
+		tile_data.set_occluder_polygons_count(occlusion_layer, base_count + polygons.size())
+	else:
+		tile_data.set_occluder_polygons_count(occlusion_layer, polygons.size())
+	for i in polygons.size():
+		var occluder := OccluderPolygon2D.new()
+		occluder.polygon = polygons[i]
+		occluder.closed = closed
+		occluder.cull_mode = cull_mode
+		tile_data.set_occluder_polygon(occlusion_layer, base_count + i, occluder)
 	return polygons.size()
 
 
